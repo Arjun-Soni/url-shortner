@@ -1,28 +1,48 @@
-from fastapi import FastAPI, HTTPException, Depends, Request
-from pydantic import BaseModel
-import secrets, string
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import RedirectResponse
-import sqlite3, re
-from urllib.parse import urlparse
+from pydantic import BaseModel
 from contextlib import asynccontextmanager
-import os
+import aiosqlite, secrets, string, re, os
+from urllib.parse import urlparse
+
+
+# App context
+
+class AppContext:
+    def __init__(self):
+        self.db: aiosqlite.Connection | None = None
+
+    async def init(self):
+        self.db = await aiosqlite.connect("urls.db")
+        self.db.row_factory = aiosqlite.Row
+        await self.db.execute("PRAGMA journal_mode=WAL")
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS urls (
+                code TEXT PRIMARY KEY,
+                url  TEXT UNIQUE
+            )
+        """)
+        await self.db.commit()
+
+    async def close(self):
+        if self.db:
+            await self.db.close()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    conn = sqlite3.connect("urls.db", check_same_thread=False)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS urls (
-        code TEXT PRIMARY KEY,
-        url TEXT UNIQUE        
-    )
-    """)
-    conn.commit()
-    conn.close()
+    ctx = AppContext()
+    await ctx.init()
+    app.state.ctx = ctx
     yield
+    await ctx.close()
+
 
 app = FastAPI(lifespan=lifespan)
-
 BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8000")
+
+
+# Helpers
 
 class URLItem(BaseModel):
     url: str
@@ -36,67 +56,56 @@ def is_valid_url(url: str) -> bool:
         result = urlparse(url)
         if result.scheme not in ("http", "https"):
             return False
-        if not result.netloc:
-            return False
-        if "@" in result.netloc:
+        if not result.netloc or "@" in result.netloc:
             return False
         domain = result.hostname
-        if not domain:
-            return False
-        return bool(DOMAIN_REGEX.match(domain))
+        return bool(domain and DOMAIN_REGEX.match(domain))
     except Exception:
         return False
 
-def generate_random_code(length=6):
+def generate_random_code(length=6) -> str:
     alphabet = string.ascii_letters + string.digits
     return ''.join(secrets.choice(alphabet) for _ in range(length))
 
-def get_db():
-    conn = sqlite3.connect("urls.db", check_same_thread=False)
-    try:
-        yield conn
-    finally:
-        conn.close()
+def get_ctx(request: Request) -> AppContext:
+    return request.app.state.ctx
+
+
+# Routes
 
 @app.get("/")
 async def hello():
     return {"message": "hello"}
 
 @app.post("/shorten")
-async def shorten_url(item: URLItem, conn=Depends(get_db)):
-    cursor = conn.cursor()
-
-    # Clean URL
+async def shorten_url(item: URLItem, ctx: AppContext = Depends(get_ctx)):
     url = item.url.strip()
-    if not url.startswith(("https://", "http://")):
+    if not url.startswith(("http://", "https://")):
         url = "http://" + url
-
-    # Validate URL
     if not is_valid_url(url):
         raise HTTPException(status_code=400, detail="Invalid URL")
 
-    cursor.execute("SELECT code FROM urls WHERE url=?", (url,))
-    existing = cursor.fetchone()
-    if existing:
-        return {"short_url": f"{BASE_URL}/{existing[0]}"}
-
     for _ in range(10):
         code = generate_random_code()
-        try:
-            cursor.execute("INSERT INTO urls (code, url) VALUES (?, ?)", (code, url))
-            conn.commit()
-            return {"short_url": f"{BASE_URL}/{code}"}
-        except sqlite3.IntegrityError:
-            continue
+        await ctx.db.execute(
+            "INSERT OR IGNORE INTO urls (code, url) VALUES (?, ?)", (code, url)
+        )
+        await ctx.db.commit()
+        async with ctx.db.execute(
+            "SELECT code FROM urls WHERE url = ?", (url,)
+        ) as cur:
+            row = await cur.fetchone()
+        if row:
+            return {"short_url": f"{BASE_URL}/{row['code']}"}
 
-    raise HTTPException(status_code=500, detail="Couldn't generate unique code. Try again.")
+    raise HTTPException(status_code=500, detail="Couldn't generate unique code.")
 
 @app.get("/{code}")
-async def redirect_url(code: str, conn=Depends(get_db)):
-    cursor = conn.cursor()
-    cursor.execute("SELECT url FROM urls WHERE code=?", (code,))
-    row = cursor.fetchone()
+async def redirect_url(code: str, ctx: AppContext = Depends(get_ctx)):
+    async with ctx.db.execute(
+        "SELECT url FROM urls WHERE code = ?", (code,)
+    ) as cur:
+        row = await cur.fetchone()
     if row:
-        return RedirectResponse(url=row[0], status_code=302)
-    else:
-        raise HTTPException(status_code=404, detail="URL not found")
+        return RedirectResponse(url=row["url"], status_code=302)
+    raise HTTPException(status_code=404, detail="URL not found")
